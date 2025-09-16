@@ -1,0 +1,229 @@
+% turbo_bpsk_r13_sova_octave.m
+% Rate-1/3 turbo (two RSC components) with BPSK over AWGN and SOVA decoding
+% Octave-compatible. Uses SOVA and trellis functions adapted from your original file.
+
+close all
+clear all
+clc
+
+% -------------------- Simulation parameters --------------------
+SNR_dB     = 3;        % Eb/No in dB (per information bit)
+K_info     = 1024;     % number of information bits per frame
+NUM_BIT    = K_info;   % alias
+NUM_FRAMES = 20;       % increase for better BER statistics
+MAX_ITERS  = 8;        % number of turbo iterations (pairs of SOVA calls)
+
+% For rate-1/3 overall, each info bit yields 3 transmitted BPSK symbols:
+% [sys, parity1, parity2] -> FRAME_SIZE = 3*NUM_BIT
+FRAME_SIZE = 3 * NUM_BIT;
+
+% -------------------- Noise parameters (BPSK, real) --------------------
+SNR_linear = 10^(0.1 * SNR_dB);
+% For BPSK, noise variance per real dimension (assuming Es=1):
+NOISE_VAR_1D = 1/(2 * SNR_linear);
+NOISE_STD_DEV = sqrt(NOISE_VAR_1D);
+
+% -------------------- Generator polynomial (used to produce parity) --------------------
+% Using the same long-division generator used earlier (example 5/7 style)
+GEN_POLY = ldiv2([1 0 1],[1 1 1],NUM_BIT); % produces parity sequence via convolution
+
+% -------------------- Interleaver --------------------
+INTR_MAP = randperm(NUM_BIT);
+DEINTR_MAP = zeros(1,NUM_BIT);
+DEINTR_MAP(INTR_MAP) = 1:NUM_BIT;
+
+% -------------------- Main loop --------------------
+tic;
+C_BER = 0;
+for FRAME_CNT = 1:NUM_FRAMES
+  % ---------- TRANSMITTER ----------
+  % Source bits
+  A = randi([0 1], 1, NUM_BIT);
+
+  % Component encoder 1 (systematic + parity1)
+  sys = A;                                % systematic bits
+  temp1 = mod(conv(GEN_POLY, sys), 2);
+  parity1 = temp1(1:NUM_BIT);             % parity from encoder 1
+
+  % Component encoder 2 (on interleaved input) -> parity2
+  sys_i = A(INTR_MAP);                    % interleaved systematic
+  temp2 = mod(conv(GEN_POLY, sys_i), 2);
+  parity2 = temp2(1:NUM_BIT);             % parity from encoder 2 (interleaved)
+
+  % Build transmit vector in order [sys(1), p1(1), p2(1), sys(2), p1(2), p2(2), ...]
+  TX = zeros(1, FRAME_SIZE);
+  TX(1:3:FRAME_SIZE) = sys;
+  TX(2:3:FRAME_SIZE) = parity1;
+  TX(3:3:FRAME_SIZE) = parity2;
+
+  % BPSK mapping: 0 -> +1, 1 -> -1
+  MOD_SIG = 1 - 2 * TX; % real symbols
+
+  % ---------- CHANNEL (AWGN) ----------
+  AWGN = randn(1, FRAME_SIZE) * NOISE_STD_DEV; % real AWGN
+  CHAN_OP = MOD_SIG + AWGN;
+
+  % ---------- RECEIVER: form the branch metrics for component decoders ----------
+  % For decoder1 we need (sys, parity1) pairs for each info bit i:
+  r_sys  = CHAN_OP(1:3:FRAME_SIZE); % received systematic
+  r_p1   = CHAN_OP(2:3:FRAME_SIZE); % received parity1
+  r_p2   = CHAN_OP(3:3:FRAME_SIZE); % received parity2
+
+  % For each bit position build distances to the 4 possible 2-bit symbols:
+  % symbol mapping indices:
+  % idx 1 -> (sys=+1, par=+1)  (corresponds to bits [0,0])
+  % idx 2 -> (sys=+1, par=-1)  (bits [0,1])
+  % idx 3 -> (sys=-1, par=+1)  (bits [1,0])
+  % idx 4 -> (sys=-1, par=-1)  (bits [1,1])
+
+  % Branch metric for decoder 1 (systematic + parity1)
+  BRANCH_METRIC1 = zeros(4, NUM_BIT);
+  % compute squared euclidean distances for the 4 combinations:
+  BRANCH_METRIC1(1,:) = (r_sys - 1).^2 + (r_p1 - 1).^2;   % [+1, +1]
+  BRANCH_METRIC1(2,:) = (r_sys - 1).^2 + (r_p1 + 1).^2;   % [+1, -1]
+  BRANCH_METRIC1(3,:) = (r_sys + 1).^2 + (r_p1 - 1).^2;   % [-1, +1]
+  BRANCH_METRIC1(4,:) = (r_sys + 1).^2 + (r_p1 + 1).^2;   % [-1, -1]
+
+  % Branch metric for decoder 2 (interleaved systematic + parity2)
+  % We must take systematic sample in interleaved order.
+  % For decoder2, the systematic seen is sys(INTR_MAP(i)) at position i.
+  % r_sys_interleaved(i) = r_sys( INTR_MAP(i) )
+  r_sys_intr = r_sys(INTR_MAP); % reorder sys to interleaved order matched to parity2 positions
+  BRANCH_METRIC2 = zeros(4, NUM_BIT);
+  BRANCH_METRIC2(1,:) = (r_sys_intr - 1).^2 + (r_p2 - 1).^2;
+  BRANCH_METRIC2(2,:) = (r_sys_intr - 1).^2 + (r_p2 + 1).^2;
+  BRANCH_METRIC2(3,:) = (r_sys_intr + 1).^2 + (r_p2 - 1).^2;
+  BRANCH_METRIC2(4,:) = (r_sys_intr + 1).^2 + (r_p2 + 1).^2;
+
+  % ---------- ITERATIVE DECODING (SOVA) ----------
+  APR_LLR = zeros(1, NUM_BIT); % initial a-priori LLRs (zeros)
+  % Sequence of SOVA calls: alternate between decoders, apply interleaver/deinterleaver
+  soft = SOVA(APR_LLR, NUM_BIT, BRANCH_METRIC1);
+  for iter = 1:MAX_ITERS
+    soft = SOVA(soft(INTR_MAP), NUM_BIT, BRANCH_METRIC2);   % decoder2 (input interleaved)
+    soft = SOVA(soft(DEINTR_MAP), NUM_BIT, BRANCH_METRIC1); % decoder1
+  end
+  % Final pass through SOVA_END on decoder2 (as final a-posteriori LLR)
+  soft = SOVA_END(soft(INTR_MAP), NUM_BIT, BRANCH_METRIC2);
+
+  % Deinterleave to original order and make hard decision
+  APP = soft(DEINTR_MAP);
+  DEC_A = APP < 0; % according to SOVA sign convention (>0 => bit 0)
+
+  % ---------- Error counting ----------
+  C_BER = C_BER + nnz(A - DEC_A);
+end
+toc;
+
+% Bit error rate
+BER = C_BER / (NUM_BIT * NUM_FRAMES);
+fprintf('Simulation finished — BER = %g (SNR_dB = %g, frames = %d)\n', BER, SNR_dB, NUM_FRAMES);
+
+% Print one frame's example (last frame)
+fprintf('Example (last frame): first 20 bits\n');
+disp(' Transmitted  : '); disp(A(1:20));
+disp(' Decoded      : '); disp(DEC_A(1:20));
+disp(' APP (LLR)    : '); disp(APP(1:20));
+
+%% -------------------- Functions (trellis + SOVA + ldiv2) --------------------
+
+% Trellis for the Convolutional encoder with generator matrix given by
+% (this trellis is for a memory-2 2-output convolutional encoder)
+function [Prev_State,Prev_Ip_trans,Outputs_prev,Prev_State_trans,Next_State,Outputs_next]= Get_Trellis()
+  Outputs_prev = [1,4; 2,3; 1,4; 2,3];
+  Prev_State = [1,2; 4,3; 2,1; 3,4];
+  Prev_State_trans = [1,4,2,3; 2,3,1,4];
+  Prev_Ip_trans = [1,1,1,1; 2,2,2,2];
+  Next_State = [1,3; 3,1; 4,2; 2,4];
+  Outputs_next = [1,4; 1,4; 2,3; 2,3];
+end
+
+% Bidirectional Soft Output Viterbi Algorithm (extrinsic)
+% Notation: if soft_output >0, then decoded bit is 0.
+function[soft_output]=SOVA(apr_LLR,num_sym,branch_metric)
+  C = log(exp(-apr_LLR/2)./(1+exp(-apr_LLR)));
+  [Prev_State,Prev_Ip_trans,Outputs_prev,Prev_State_trans,Next_State,Outputs_next]= Get_Trellis();
+  num_states = 4;
+  soft_output = zeros(1,num_sym);
+  survivor_node = zeros(num_states,num_sym);
+  survivor_ip = zeros(num_states,num_sym);
+  F_path_metric = zeros(num_states,num_sym+1);
+  B_path_metric = zeros(num_states,num_sym+1);
+  index_temp = [0;1*2;2*2;3*2];
+  for sym_cnt=1:num_sym
+    % forward recursion (min over two predecessor branches per state)
+    [F_path_metric(:,sym_cnt+1), index] = min([ ...
+      F_path_metric(Prev_State(:,1),sym_cnt) + branch_metric(Outputs_prev(:,1),sym_cnt) - (C(sym_cnt) + apr_LLR(sym_cnt)/2), ...
+      F_path_metric(Prev_State(:,2),sym_cnt) + branch_metric(Outputs_prev(:,2),sym_cnt) - ((C(sym_cnt) - apr_LLR(sym_cnt)/2)) ], [], 2);
+
+    % backward recursion (building from the tail)
+    [B_path_metric(:, num_sym+1-sym_cnt), ~] = min([ ...
+      B_path_metric(Next_State(:,1), num_sym+2-sym_cnt) + branch_metric(Outputs_next(:,1), num_sym+1-sym_cnt) - (C(num_sym+1-sym_cnt) + apr_LLR(num_sym+1-sym_cnt)/2), ...
+      B_path_metric(Next_State(:,2), num_sym+2-sym_cnt) + branch_metric(Outputs_next(:,2), num_sym+1-sym_cnt) - (C(num_sym+1-sym_cnt) - apr_LLR(num_sym+1-sym_cnt)/2) ], [], 2);
+
+    survivor_node(:,sym_cnt) = Prev_State_trans(index + index_temp);
+    survivor_ip(:,sym_cnt) = Prev_Ip_trans(index + index_temp);
+  end
+
+  [ml_metric, trace_bf] = min(F_path_metric(:, num_sym+1));
+
+  for bk_cnt = num_sym:-1:1
+    ip = survivor_ip(trace_bf, bk_cnt);
+    com_ip = bitxor(ip-1, 1) + 1; % complementary input (index 1/2)
+    com_metric = min(F_path_metric(:, bk_cnt) + branch_metric(Outputs_next(:, com_ip), bk_cnt) + B_path_metric(Next_State(:, com_ip), bk_cnt+1) );
+    soft_output(bk_cnt) = ((-1)^(ip+1)) * (com_metric - ml_metric);
+    trace_bf = survivor_node(trace_bf, bk_cnt);
+  end
+
+  % clipping to avoid numerical issues
+  soft_output(soft_output > 50) = 50;
+  soft_output(soft_output < -50) = -50;
+end
+
+% Bidirectional Soft Output Viterbi Algorithm (final iteration -> a-posteriori)
+function[soft_output]=SOVA_END(apr_LLR,num_sym,branch_metric)
+  C = log(exp(-apr_LLR/2)./(1+exp(-apr_LLR)));
+  [Prev_State,Prev_Ip_trans,Outputs_prev,Prev_State_trans,Next_State,Outputs_next]= Get_Trellis();
+  num_states = 4;
+  soft_output = zeros(1,num_sym);
+  survivor_node = zeros(num_states,num_sym);
+  survivor_ip = zeros(num_states,num_sym);
+  F_path_metric = zeros(num_states,num_sym+1);
+  B_path_metric = zeros(num_states,num_sym+1);
+  index_temp = [0;1*2;2*2;3*2];
+  for sym_cnt=1:num_sym
+    [F_path_metric(:,sym_cnt+1), index] = min([ ...
+      F_path_metric(Prev_State(:,1),sym_cnt) + branch_metric(Outputs_prev(:,1),sym_cnt) - (C(sym_cnt) + apr_LLR(sym_cnt)/2), ...
+      F_path_metric(Prev_State(:,2),sym_cnt) + branch_metric(Outputs_prev(:,2),sym_cnt) - (C(sym_cnt) - apr_LLR(sym_cnt)/2) ], [], 2);
+
+    [B_path_metric(:, num_sym+1-sym_cnt), ~] = min([ ...
+      B_path_metric(Next_State(:,1), num_sym+2-sym_cnt) + branch_metric(Outputs_next(:,1), num_sym+1-sym_cnt) - (C(num_sym+1-sym_cnt) + apr_LLR(num_sym+1-sym_cnt)/2), ...
+      B_path_metric(Next_State(:,2), num_sym+2-sym_cnt) + branch_metric(Outputs_next(:,2), num_sym+1-sym_cnt) - (C(num_sym+1-sym_cnt) - apr_LLR(num_sym+1-sym_cnt)/2) ], [], 2);
+
+    survivor_node(:,sym_cnt) = Prev_State_trans(index + index_temp);
+    survivor_ip(:,sym_cnt) = Prev_Ip_trans(index + index_temp);
+  end
+
+  [ml_metric, trace_bf] = min(F_path_metric(:, num_sym+1));
+
+  for bk_cnt = num_sym:-1:1
+    ip = survivor_ip(trace_bf, bk_cnt);
+    com_ip = bitxor(ip-1, 1) + 1;
+    com_metric = min(F_path_metric(:, bk_cnt) + branch_metric(Outputs_next(:, com_ip), bk_cnt) - (C(bk_cnt) + ((-1)^(com_ip-1))*apr_LLR(bk_cnt)/2) + B_path_metric(Next_State(:, com_ip), bk_cnt+1));
+    soft_output(bk_cnt) = ((-1)^(ip+1)) * (com_metric - ml_metric);
+    trace_bf = survivor_node(trace_bf, bk_cnt);
+  end
+
+  soft_output(soft_output > 50) = 50;
+  soft_output(soft_output < -50) = -50;
+end
+
+% Long division of polynomials over GF(2)
+function [quotient] = ldiv2(NP,DP,num_terms)
+  quotient = zeros(1,num_terms);
+  for coef_cnt = 1:num_terms
+    quotient(coef_cnt) = NP(1);
+    temp = bitxor(NP, DP * NP(1));
+    NP = [temp(2:end) 0];
+  end
+end
