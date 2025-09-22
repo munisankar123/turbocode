@@ -1,269 +1,304 @@
 `timescale 1ns / 1ps
 
-module rsc_decoding #(
-    parameter N = 24              // block size (multiple of 3) -> N/3 = 8
+module turbo_decoding #(
+    parameter N = 24  // block size (multiple of 3)
 )(
-    input   clk,
-    input   rst,
-    input   signed [7:0] ip,    // 8-bit signed input (streamed: sys, par1, par2, ...)
-    output reg  signed [7:0] sys_in,
-    output reg  signed [7:0] parity1,
-    output reg  signed [7:0] parity2,
-    output reg  read_flag_r,
-    output reg [7:0] wr_addr,
-    output reg [7:0] rd_addr,
-    output reg signed [7:0] data_sys,
-    output reg signed [7:0] data_par1,
-    output reg signed [7:0] data_par2,
-    output reg buffer_ready,
-    output reg signed [7:0] c1,c2,c3,c4,c5,c6,c7,c8,
-    output reg [3:0] count_buff,
-    output reg [4:0] count_disp,
-
-    // alpha/beta debug outputs & flags
-    output reg alpha_done,
-    output reg beta_done,
-    output reg signed [7:0] d1,d2,d3,d4,d5,d6,d7,d8,d9,
-    output reg signed [7:0] e1,e2,e3,e4,e5,e6,e7,e8,e9
+    input wire clk,
+    input wire rst,
+    input wire signed [7:0] ip,      // serial encoded input (sys+parity1+parity2)
+    output reg signed [7:0] sys_in,
+    output reg signed [7:0] parity1,
+    output reg signed [7:0] parity2,
+    output reg read_flag
 );
 
-    // ------------------------------
-    // gamma and related buffers
-    // ------------------------------
-    reg signed [7:0] gamma_buff[0:3][0:1][0:7]; // [state][u][time]
-    reg signed [7:0] La_buff[0:7];
-
-    // RAM and read state
-    reg signed [7:0] ram [0:255];
-    reg [3:0] read_count;
+    reg [7:0] rd_addr;
     reg reading;
-    reg read_flag;
+    reg [3:0] read_count;
 
-    // Intermediate buffers (hold one block = 8 samples)
-    reg signed [7:0] buffer_sys [0:7];
-    reg signed [7:0] buffer_par1 [0:7];
-    reg signed [7:0] buffer_par2 [0:7];
+    reg signed [7:0] ram[0:N*3-1];  // assume input loaded elsewhere
 
-    // gamma temporaries
-    reg signed [7:0] g111,g121,g211,g221,g311,g321,g411,g421;
+    reg signed [7:0] data_sys[0:7];
+    reg signed [7:0] data_par1[0:7];
+    reg signed [7:0] data_par2[0:7];
 
-    // sequential gamma compute
-    reg compute_gamma;
-    reg [3:0] gamma_index; // 0..7
-    reg [7:0]alpha_buff[0:3][0:8];
-    reg [7:0]beta_buff[0:3][0:8];
-    integer ii,jj;
+    // Buffers
+    reg signed [7:0] buffer2[0:7];
+    reg signed [7:0] buffer3[0:7];
+    reg signed [7:0] gamma_buffer[0:3][0:1][0:7];
 
-    // ------------------- Initialization --------------------
-    initial begin
-        for (ii = 0; ii < 8; ii = ii + 1) La_buff[ii] = 0;
+    reg [3:0] count;
+    reg buffer_ready;
+    reg buffer_ready_r, buffer_ready_2r;
+
+    // Alpha / Beta buffers
+    reg signed [7:0] alpha_buff[0:3][0:8];
+    reg signed [7:0] beta_buff[0:3][0:9];
+    reg [3:0] buff_count;
+    reg [3:0] up_count;
+
+    // Temp variables
+    reg signed [7:0] temp1,temp2,temp3,temp4,temp5,temp6,temp7,temp8;
+    reg signed [7:0] b1,b2,b3,b4,b5,b6,b7,b8;
+
+    // LLR calculation
+    reg alpha_beta_done, alpha_beta_done_r, alpha_beta_done_2r;
+    reg [3:0] llr_count;
+    reg signed [7:0] num, den;
+    reg signed [7:0] val10,val11,val20,val21,val30,val31,val40,val41;
+    reg signed [7:0] Lapp,Lext;
+    reg signed [7:0] L_ext[0:7];
+
+    // ---------------- READ LOGIC ----------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            sys_in     <= 0;
+            parity1    <= 0;
+            parity2    <= 0;
+            rd_addr    <= 0;
+            read_count <= 0;
+            reading    <= 0;
+            read_flag  <= 0;
+        end else if (reading) begin
+            sys_in   <= ram[rd_addr];
+            parity1  <= ram[rd_addr + 1];
+            parity2  <= ram[rd_addr + 2];
+
+            rd_addr    <= rd_addr + 3;
+            read_count <= read_count + 1'b1;
+
+            data_sys[read_count]  <= sys_in;
+            data_par1[read_count] <= parity1;
+            data_par2[read_count] <= parity2;
+
+            if (read_count == 7) begin
+                reading   <= 0;
+                read_flag <= 0;
+            end
+        end
     end
 
-    // ------------------- RAM WRITE & READ --------------------
-    always @(posedge clk) begin
+    // ---------------- GAMMA BUFFER ----------------
+    always @(posedge clk or posedge rst) begin
         if (rst) begin
-            wr_addr    <= 0; rd_addr <= 0;
-            read_count <= 0; reading <= 0;
-            sys_in <= 0; parity1 <= 0; parity2 <= 0;
-            read_flag <= 0; data_sys <= 0; data_par1 <= 0; data_par2 <= 0;
-            count_disp <= 0; compute_gamma <= 0; buffer_ready <= 0; read_flag_r <= 0;
-            count_buff <= 0; gamma_index <= 0;
-            alpha_done <= 0; beta_done <= 0;
+            count        <= 0;
+            buffer_ready <= 0;
+        end else if (read_flag) begin
+            gamma_buffer[0][0][count] <= g_111;
+            gamma_buffer[0][1][count] <= g_121;
+            gamma_buffer[1][0][count] <= g_211;
+            gamma_buffer[1][1][count] <= g_221;
+            gamma_buffer[2][0][count] <= g_311;
+            gamma_buffer[2][1][count] <= g_321;
+            gamma_buffer[3][0][count] <= g_411;
+            gamma_buffer[3][1][count] <= g_421;
 
-            // clear gamma
-            for (ii = 0; ii < 8; ii = ii + 1) begin
-                gamma_buff[0][0][ii] <= -127; gamma_buff[0][1][ii] <= -127;
-                gamma_buff[1][0][ii] <= -127; gamma_buff[1][1][ii] <= -127;
-                gamma_buff[2][0][ii] <= -127; gamma_buff[2][1][ii] <= -127;
-                gamma_buff[3][0][ii] <= -127; gamma_buff[3][1][ii] <= -127;
+            count <= count + 1'b1;
+            if (count == 4'd7) begin
+                buffer_ready <= 1;
+                count        <= 0;
             end
+        end
+    end
 
-            // clear alpha
-            for (jj = 0; jj < 9; jj = jj + 1) begin
-                alpha_buff[0][jj] <= (jj==0) ? 0 : -127;
-                alpha_buff[1][jj] <= -127;
-                alpha_buff[2][jj] <= -127;
-                alpha_buff[3][jj] <= -127;
-            end
-
-            // clear outputs
-            c1<=0; c2<=0; c3<=0; c4<=0; c5<=0; c6<=0; c7<=0; c8<=0;
-            d1<=0;d2<=0;d3<=0;d4<=0;d5<=0;d6<=0;d7<=0;d8<=0;d9<=0;
-            e1<=0;e2<=0;e3<=0;e4<=0;e5<=0;e6<=0;e7<=0;e8<=0;e9<=0;
+    // ---------------- ALPHA / BETA UPDATE ----------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            up_count       <= 0;
+            buffer_ready_r <= 0;
+            buffer_ready_2r <= 0;
+            buff_count     <= 0;
         end else begin
-            // Write streaming input into RAM sequentially
-            ram[wr_addr] <= ip;
-            wr_addr <= (wr_addr == 8'd240) ? 0 : wr_addr + 1;
-            read_flag_r <= read_flag;
+            buffer_ready_r  <= buffer_ready;
+            buffer_ready_2r <= buffer_ready_r;
 
-            // Start reading when block full
-            if (!reading && (wr_addr != 0) && (wr_addr % N == 0)) begin
-                reading    <= 1;
-                read_flag  <= 1;
-                rd_addr    <= wr_addr - N;
-                read_count <= 0;
-                buffer_ready <= 0; alpha_done <= 0; beta_done <= 0;
+            if (buffer_ready) begin
+                buff_count <= buff_count + 1'b1;
+                if (buff_count >= 7) begin
+                    buff_count   <= 0;
+                    buffer_ready <= 0;
+                end
+
+                // TEMP alpha candidates
+                temp1 <= (alpha_buff[0][buff_count+1] >= alpha_buff[0][buff_count] + gamma_buffer[0][0][buff_count]) ?
+                          alpha_buff[0][buff_count+1] : alpha_buff[0][buff_count] + gamma_buffer[0][0][buff_count];
+                temp5 <= (alpha_buff[2][buff_count+1] >= alpha_buff[0][buff_count] + gamma_buffer[0][1][buff_count]) ?
+                          alpha_buff[2][buff_count+1] : alpha_buff[0][buff_count] + gamma_buffer[0][1][buff_count];
+                temp6 <= (alpha_buff[2][buff_count+1] >= alpha_buff[1][buff_count] + gamma_buffer[1][0][buff_count]) ?
+                          alpha_buff[2][buff_count+1] : alpha_buff[1][buff_count] + gamma_buffer[1][0][buff_count];
+                temp2 <= (alpha_buff[0][buff_count+1] >= alpha_buff[1][buff_count] + gamma_buffer[1][1][buff_count]) ?
+                          alpha_buff[0][buff_count+1] : alpha_buff[1][buff_count] + gamma_buffer[1][1][buff_count];
+                temp3 <= (alpha_buff[1][buff_count+1] >= alpha_buff[2][buff_count] + gamma_buffer[2][0][buff_count]) ?
+                          alpha_buff[1][buff_count+1] : alpha_buff[3][buff_count] + gamma_buffer[2][0][buff_count];
+                temp7 <= (alpha_buff[3][buff_count+1] >= alpha_buff[2][buff_count] + gamma_buffer[2][1][buff_count]) ?
+                          alpha_buff[2][buff_count+1] : alpha_buff[3][buff_count] + gamma_buffer[2][1][buff_count];
+                temp8 <= (alpha_buff[3][buff_count+1] >= alpha_buff[3][buff_count] + gamma_buffer[3][0][buff_count]) ?
+                          alpha_buff[3][buff_count+1] : alpha_buff[3][buff_count] + gamma_buffer[3][0][buff_count];
+                temp4 <= (alpha_buff[1][buff_count+1] >= alpha_buff[3][buff_count] + gamma_buffer[3][1][buff_count]) ?
+                          alpha_buff[1][buff_count+1] : alpha_buff[3][buff_count] + gamma_buffer[3][1][buff_count];
+
+                // TEMP beta candidates
+                b1 <= (beta_buff[0][9-buff_count+1] >= beta_buff[0][8-buff_count] + gamma_buffer[0][0][7-buff_count]) ?
+                      beta_buff[0][9-buff_count+1] : beta_buff[0][8-buff_count] + gamma_buffer[0][0][7-buff_count];
+                b2 <= (beta_buff[1][9-buff_count+1] >= beta_buff[1][8-buff_count] + gamma_buffer[1][1][7-buff_count]) ?
+                      beta_buff[1][9-buff_count+1] : beta_buff[1][8-buff_count] + gamma_buffer[1][1][7-buff_count];
+                b3 <= (beta_buff[1][9-buff_count+1] >= beta_buff[2][8-buff_count] + gamma_buffer[2][0][7-buff_count]) ?
+                      beta_buff[1][9-buff_count+1] : beta_buff[3][8-buff_count] + gamma_buffer[2][0][7-buff_count];
+                b4 <= (beta_buff[3][9-buff_count+1] >= beta_buff[3][8-buff_count] + gamma_buffer[3][1][7-buff_count]) ?
+                      beta_buff[3][9-buff_count+1] : beta_buff[3][8-buff_count] + gamma_buffer[3][1][7-buff_count];
+                b5 <= (beta_buff[2][9-buff_count+1] >= beta_buff[0][8-buff_count] + gamma_buffer[0][1][7-buff_count]) ?
+                      beta_buff[2][9-buff_count+1] : beta_buff[0][8-buff_count] + gamma_buffer[0][1][7-buff_count];
+                b6 <= (beta_buff[2][9-buff_count+1] >= beta_buff[1][8-buff_count] + gamma_buffer[1][0][7-buff_count]) ?
+                      beta_buff[2][9-buff_count+1] : beta_buff[1][8-buff_count] + gamma_buffer[1][0][7-buff_count];
+                b7 <= (beta_buff[3][9-buff_count+1] >= beta_buff[2][8-buff_count] + gamma_buffer[2][1][7-buff_count]) ?
+                      beta_buff[2][9-buff_count+1] : beta_buff[3][8-buff_count] + gamma_buffer[2][1][7-buff_count];
+                b8 <= (beta_buff[3][9-buff_count+1] >= beta_buff[3][8-buff_count] + gamma_buffer[3][0][7-buff_count]) ?
+                      beta_buff[3][9-buff_count+1] : beta_buff[3][8-buff_count] + gamma_buffer[3][0][7-buff_count];
             end
 
-            // Read N/3 (=8) triplets into buffers
-            if (reading) begin
-                sys_in   <= ram[rd_addr];
-                parity1  <= ram[rd_addr + 1];
-                parity2  <= ram[rd_addr + 2];
+            // Update alpha / beta
+            if (buffer_ready_r || buffer_ready_2r) begin
+                up_count <= up_count + 1'b1;
+                if (up_count >= 7)
+                    up_count <= 0;
+                else begin
+                    alpha_buff[0][up_count+1] <= (temp1 >= temp2) ? temp1 : temp2;
+                    alpha_buff[1][up_count+1] <= (temp3 >= temp4) ? temp3 : temp4;
+                    alpha_buff[2][up_count+1] <= (temp5 >= temp6) ? temp5 : temp6;
+                    alpha_buff[3][up_count+1] <= (temp7 >= temp8) ? temp7 : temp8;
 
-                buffer_sys[read_count]  <= ram[rd_addr];
-                buffer_par1[read_count] <= ram[rd_addr + 1];
-                buffer_par2[read_count] <= ram[rd_addr + 2];
-
-                data_sys  <= ram[rd_addr];
-                data_par1 <= ram[rd_addr + 1];
-                data_par2 <= ram[rd_addr + 2];
-
-                rd_addr    <= rd_addr + 3;
-                read_count <= read_count + 1;
-
-                if (read_count == 4'd7) begin
-                    reading   <= 0;
-                    read_flag <= 0;
-                    compute_gamma <= 1;
-                    gamma_index <= 0;
+                    beta_buff[0][9-up_count+1] <= (b1 >= b2) ? b1 : b2;
+                    beta_buff[1][9-up_count+1] <= (b3 >= b4) ? b3 : b4;
+                    beta_buff[2][9-up_count+1] <= (b5 >= b6) ? b5 : b6;
+                    beta_buff[3][9-up_count+1] <= (b7 >= b8) ? b7 : b8;
                 end
             end
         end
     end
 
-    // ------------------- GAMMA COMPUTATION --------------------
-    always @(posedge clk) begin
+    // ---------------- ALPHA-BETA DONE FLAG ----------------
+    always @(posedge clk or posedge rst) begin
         if (rst) begin
-            compute_gamma <= 0; gamma_index <= 0;
-        end else if (compute_gamma) begin
-            // Compute gamma
-            g111 = ( buffer_sys[gamma_index] + La_buff[gamma_index] + buffer_par1[gamma_index] ) >>> 1;
-            g121 = ( -buffer_sys[gamma_index] - La_buff[gamma_index] - buffer_par1[gamma_index] ) >>> 1;
-            g211 = ( buffer_sys[gamma_index] + La_buff[gamma_index] + buffer_par2[gamma_index] ) >>> 1;
-            g221 = ( -buffer_sys[gamma_index] - La_buff[gamma_index] - buffer_par2[gamma_index] ) >>> 1;
-            g311 = ( buffer_sys[gamma_index] + La_buff[gamma_index] - buffer_par1[gamma_index] ) >>> 1;
-            g321 = ( -buffer_sys[gamma_index] - La_buff[gamma_index] + buffer_par1[gamma_index] ) >>> 1;
-            g411 = ( buffer_sys[gamma_index] + La_buff[gamma_index] - buffer_par2[gamma_index] ) >>> 1;
-            g421 = ( -buffer_sys[gamma_index] - La_buff[gamma_index] + buffer_par2[gamma_index] ) >>> 1;
-
-            gamma_buff[0][0][gamma_index] <= g111; gamma_buff[0][1][gamma_index] <= g121;
-            gamma_buff[1][0][gamma_index] <= g211; gamma_buff[1][1][gamma_index] <= g221;
-            gamma_buff[2][0][gamma_index] <= g311; gamma_buff[2][1][gamma_index] <= g321;
-            gamma_buff[3][0][gamma_index] <= g411; gamma_buff[3][1][gamma_index] <= g421;
-
-            if (gamma_index == 4'd7) begin
-                compute_gamma <= 0;
-                buffer_ready <= 1;
-                count_disp <= 0;
-            end else gamma_index <= gamma_index + 1'b1;
-        end
-    end
-
-    // ------------------- OUTPUT c1..c8 (gamma display) --------------------
-    always @(posedge clk) begin
-        if (rst) begin
-            c1<=0; c2<=0; c3<=0; c4<=0; c5<=0; c6<=0; c7<=0; c8<=0;
-            count_disp <= 0;
-        end else if (buffer_ready) begin
-            c1 <= gamma_buff[0][0][count_disp];
-            c2 <= gamma_buff[0][1][count_disp];
-            c3 <= gamma_buff[1][0][count_disp];
-            c4 <= gamma_buff[1][1][count_disp];
-            c5 <= gamma_buff[2][0][count_disp];
-            c6 <= gamma_buff[2][1][count_disp];
-            c7 <= gamma_buff[3][0][count_disp];
-            c8 <= gamma_buff[3][1][count_disp];
-
-            count_disp <= (count_disp == 4'd7) ? 0 : count_disp + 1'b1;
-        end
-    end
-
-    // ------------------- ALPHA CALCULATION --------------------
-    reg [3:0] alpha_index;
-    reg [3:0]beta_index;
-    reg alpha_running;
-    reg beta_done;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            alpha_index <= 0;
-            alpha_done  <= 0;
-            beta_done<=0;
-            alpha_running <= 0;
-            d1<=0;d2<=0;d3<=0;d4<=0;d5<=0;d6<=0;d7<=0;d8<=0;d9<=0;
-        end else if (buffer_ready) begin
-            if (!alpha_running) begin
-                alpha_running <= 1;
-                alpha_index <= 0;
-                alpha_done <= 0;
+            alpha_beta_done   <= 0;
+            alpha_beta_done_r <= 0;
+            alpha_beta_done_2r <= 0;
+        end else begin
+            if (buffer_ready) begin
+                alpha_beta_done <= 0;
             end else begin
-                // Forward recursion for alpha
-                alpha_buff[0][alpha_index+1] <= (alpha_buff[0][alpha_index+1] >= alpha_buff[0][alpha_index] + gamma_buff[0][0][alpha_index]) ?
-                                                alpha_buff[0][alpha_index+1] : alpha_buff[0][alpha_index] + gamma_buff[0][0][alpha_index];
-                alpha_buff[2][alpha_index+1] <= (alpha_buff[2][alpha_index+1] >= alpha_buff[0][alpha_index] + gamma_buff[0][1][alpha_index]) ?
-                                                alpha_buff[2][alpha_index+1] : alpha_buff[0][alpha_index] + gamma_buff[0][1][alpha_index];
-
-                alpha_buff[2][alpha_index+1] <= (alpha_buff[2][alpha_index+1] >= alpha_buff[1][alpha_index] + gamma_buff[1][0][alpha_index]) ?
-                                                alpha_buff[2][alpha_index+1] : alpha_buff[1][alpha_index] + gamma_buff[1][0][alpha_index];
-                alpha_buff[0][alpha_index+1] <= (alpha_buff[0][alpha_index+1] >= alpha_buff[1][alpha_index] + gamma_buff[1][1][alpha_index]) ?
-                                                alpha_buff[0][alpha_index+1] : alpha_buff[1][alpha_index] + gamma_buff[1][1][alpha_index];
-
-                alpha_buff[1][alpha_index+1] <= (alpha_buff[1][alpha_index+1] >= alpha_buff[2][alpha_index] + gamma_buff[2][0][alpha_index]) ?
-                                                alpha_buff[1][alpha_index+1] : alpha_buff[2][alpha_index] + gamma_buff[2][0][alpha_index];
-                alpha_buff[3][alpha_index+1] <= (alpha_buff[3][alpha_index+1] >= alpha_buff[2][alpha_index] + gamma_buff[2][1][alpha_index]) ?
-                                                alpha_buff[3][alpha_index+1] : alpha_buff[2][alpha_index] + gamma_buff[2][1][alpha_index];
-
-                alpha_buff[3][alpha_index+1] <= (alpha_buff[3][alpha_index+1] >= alpha_buff[3][alpha_index] + gamma_buff[3][0][alpha_index]) ?
-                                                alpha_buff[3][alpha_index+1] : alpha_buff[3][alpha_index] + gamma_buff[3][0][alpha_index];
-                alpha_buff[1][alpha_index+1] <= (alpha_buff[1][alpha_index+1] >= alpha_buff[3][alpha_index] + gamma_buff[3][1][alpha_index]) ?
-                                                alpha_buff[1][alpha_index+1] : alpha_buff[3][alpha_index] + gamma_buff[3][1][alpha_index];
-                                                
-                beta_buff[0][beta_index+1] <= (beta_buff[0][beta_index+1] >= beta_buff[0][beta_index] + gamma_buff[0][0][beta_index]) ?
-                                                beta_buff[0][beta_index+1] : beta_buff[0][beta_index] + gamma_buff[0][0][beta_index];
-                beta_buff[2][beta_index+1] <= (beta_buff[2][beta_index+1] >= beta_buff[0][beta_index] + gamma_buff[0][1][beta_index]) ?
-                                                beta_buff[2][beta_index+1] : beta_buff[0][beta_index] + gamma_buff[0][1][beta_index];
-
-                beta_buff[2][beta_index+1] <= (beta_buff[2][beta_index+1] >= beta_buff[1][beta_index] + gamma_buff[1][0][beta_index]) ?
-                                                beta_buff[2][beta_index+1] : beta_buff[1][beta_index] + gamma_buff[1][0][beta_index];
-                beta_buff[0][beta_index+1] <= (beta_buff[0][beta_index+1] >= beta_buff[1][beta_index] + gamma_buff[1][1][beta_index]) ?
-                                                beta_buff[0][beta_index+1] : beta_buff[1][beta_index] + gamma_buff[1][1][beta_index];
-
-                beta_buff[1][beta_index+1] <= (beta_buff[1][beta_index+1] >= beta_buff[2][beta_index] + gamma_buff[2][0][beta_index]) ?
-                                                beta_buff[1][beta_index+1] : beta_buff[2][beta_index] + gamma_buff[2][0][beta_index];
-                beta_buff[3][beta_index+1] <= (beta_buff[3][beta_index+1] >= beta_buff[2][beta_index] + gamma_buff[2][1][beta_index]) ?
-                                                beta_buff[3][beta_index+1] : beta_buff[2][beta_index] + gamma_buff[2][1][beta_index];
-
-                beta_buff[3][beta_index+1] <= (beta_buff[3][beta_index+1] >= beta_buff[3][beta_index] + gamma_buff[3][0][beta_index]) ?
-                                                beta_buff[3][beta_index+1] : beta_buff[3][beta_index] + gamma_buff[3][0][beta_index];
-                beta_buff[1][beta_index+1] <= (beta_buff[1][beta_index+1] >= beta_buff[3][beta_index] + gamma_buff[3][1][beta_index]) ?
-                                                beta_buff[1][beta_index+1] : beta_buff[3][beta_index] + gamma_buff[3][1][beta_index];
-                                                
-                                                     
-                         
-                // Update debug outputs
-                d1 <= alpha_buff[0][alpha_index+1]; d2 <= alpha_buff[1][alpha_index+1];
-                d3 <= alpha_buff[2][alpha_index+1]; d4 <= alpha_buff[3][alpha_index+1];
-
-                          
-                // Update debug outputs
-                e1 <= alpha_buff[0][alpha_index+1]; e2 <= alpha_buff[1][alpha_index+1];
-                e3 <= alpha_buff[2][alpha_index+1]; e4 <= alpha_buff[3][alpha_index+1];
-
-                if (alpha_index == 4'd7) begin
-                    alpha_done <= 1;
-                    beta_done<=1;
-                    alpha_running <= 0;
-                end else alpha_index <= alpha_index + 1'b1;beta_index<=beta_index+1'b1;
+                alpha_beta_done <= 1;
             end
+            alpha_beta_done_r   <= alpha_beta_done;
+            alpha_beta_done_2r  <= alpha_beta_done_r;
         end
     end
-    
-    
-    always@(posedge clk)begin
-        if(alpha_done==1 && beta_done==1)begin
-        
+
+    // ---------------- LLR CALCULATION ----------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            llr_count <= 0;
+            num <= -127; den <= -127;
+            val10<= -127; val11<= -127; val20<= -127; val21<= -127;
+            val30<= -127; val31<= -127; val40<= -127; val41<= -127;
+            Lapp <= 0; Lext <= 0;
+        end else if (alpha_beta_done) begin
+            llr_count <= llr_count + 1'b1;
+            if (llr_count >= 7) llr_count <= 0;
+        end else begin
+            val10 <= alpha_buff[0][llr_count] + gamma_buffer[0][0][llr_count] + beta_buff[0][llr_count+1];
+            val11 <= alpha_buff[0][llr_count] + gamma_buffer[0][1][llr_count] + beta_buff[2][llr_count+1];
+            val20 <= alpha_buff[1][llr_count] + gamma_buffer[1][0][llr_count] + beta_buff[2][llr_count+1];
+            val21 <= alpha_buff[1][llr_count] + gamma_buffer[1][1][llr_count] + beta_buff[0][llr_count+1];
+            val30 <= alpha_buff[2][llr_count] + gamma_buffer[2][0][llr_count] + beta_buff[1][llr_count+1];
+            val31 <= alpha_buff[2][llr_count] + gamma_buffer[2][1][llr_count] + beta_buff[3][llr_count+1];
+            val40 <= alpha_buff[3][llr_count] + gamma_buffer[3][0][llr_count] + beta_buff[3][llr_count+1];
+            val41 <= alpha_buff[3][llr_count] + gamma_buffer[3][1][llr_count] + beta_buff[1][llr_count+1];
+
+           
+
+            Lapp <= num - den;
+            Lext <= Lapp - data_sys[llr_count] - data_par1[llr_count];
+            L_ext[llr_count] <= Lext;
         end
     end
+
+    // ---------------- MODULES ----------------
+    branch_metric_calculation bmc(
+        clk,
+        !read_flag,
+        sys_in, parity1,
+        g_111,g_121,g_211,g_221,g_311,g_321,g_411,g_421
+    );
+     // Compute maximums
+            maximum m1(val10,val20,val30,val40,num);
+            maximum m2(val11,val21,val31,val41,den);
 
 endmodule
+
+
+// ---------------- MAXIMUM FUNCTION ----------------
+module maximum(a,b,c,d,max);
+    input signed [7:0] a,b,c,d;
+    output wire signed [7:0] max;
+    wire signed [7:0] max1,max2;
+
+    assign max1 = (a>=b)? a : b;
+    assign max2 = (c>=d)? c : d;
+    assign max  = (max1>=max2)? max1 : max2;
+endmodule
+
+
+`timescale 1ns / 1ps
+module branch_metric_calculation(
+    input wire clk,
+    input wire rst,                  // synchronous reset
+    input wire enable,               // active-high enable for calculation
+    input wire signed [7:0] L_sys,  // systematic input
+    input wire signed [7:0] L_p1,   // parity1 input
+    
+    output reg signed [7:0] g_111,
+    output reg signed [7:0] g_121,
+    output reg signed [7:0] g_211,
+    output reg signed [7:0] g_221,
+    output reg signed [7:0] g_311,
+    output reg signed [7:0] g_321,
+    output reg signed [7:0] g_411,
+    output reg signed [7:0] g_421
+);
+
+    // internal extrinsic input, assuming zero if not connected
+    reg signed [7:0] La;
+    
+    always @(posedge clk) begin
+        if (rst) begin
+            g_111 <= 0;
+            g_121 <= 0;
+            g_211 <= 0;
+            g_221 <= 0;
+            g_311 <= 0;
+            g_321 <= 0;
+            g_411 <= 0;
+            g_421 <= 0;
+            La    <= 0;
+        end else if (enable) begin
+            g_111 <= (-La - L_sys - L_p1) >>> 1;
+            g_121 <= ( La + L_sys - L_p1) >>> 1;
+            g_211 <= (-La - L_sys + L_p1) >>> 1;
+            g_221 <= ( La + L_sys + L_p1) >>> 1;
+            g_311 <= (-La - L_sys + L_p1) >>> 1;
+            g_321 <= ( La + L_sys + L_p1) >>> 1;
+            g_411 <= (-La - L_sys - L_p1) >>> 1;
+            g_421 <= ( La + L_sys - L_p1) >>> 1;
+        end else begin
+            g_111 <= 0;
+            g_121 <= 0;
+            g_211 <= 0;
+            g_221 <= 0;
+            g_311 <= 0;
+            g_321 <= 0;
+            g_411 <= 0;
+            g_421 <= 0;
+        end
+    end
+endmodule
+
